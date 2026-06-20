@@ -19,8 +19,7 @@ Bibliothèque modulaire regroupant des composants bas niveau réutilisables :
 gestion mémoire **interne** et **externe**, interface **console** interactive,
 et système d'**overlays** graphiques.
 
-Chaque domaine vit sur sa propre branche pour itérer en isolation,
-puis converge sur `main` une fois validé.
+Chaque domaine vit sur sa propre branche pour itérer en isolation.
 
 ---
 
