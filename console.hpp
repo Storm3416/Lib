@@ -48,7 +48,15 @@ public:
             return true;
 
 #if defined(_WIN32)
-        AllocConsole();
+        const bool HasConsole = GetConsoleWindow() != nullptr;
+        OwnsConsole = !HasConsole;
+
+        if (!HasConsole && !AllocConsole())
+        {
+            Attached.store(false, std::memory_order_release);
+            return false;
+        }
+
         if (Title) SetConsoleTitleA(Title);
 
         FILE* Stream = nullptr;
@@ -59,10 +67,13 @@ public:
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         std::setvbuf(stderr, nullptr, _IONBF, 0);
 
-        HANDLE OutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+        HANDLE OutHandle = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
         DWORD Mode = 0;
-        if (GetConsoleMode(OutHandle, &Mode))
+        if (OutHandle != INVALID_HANDLE_VALUE && GetConsoleMode(OutHandle, &Mode))
             SetConsoleMode(OutHandle, Mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT);
+        if (OutHandle != INVALID_HANDLE_VALUE) CloseHandle(OutHandle);
 #else
         if (Title) std::printf("\033]0;%s\007", Title);
         std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -76,7 +87,8 @@ public:
         if (!Attached.exchange(false, std::memory_order_acq_rel))
             return;
 #if defined(_WIN32)
-        FreeConsole();
+        if (OwnsConsole) FreeConsole();
+        OwnsConsole = false;
 #endif
     }
 
@@ -293,11 +305,11 @@ private:
     {
         switch (L)
         {
-            case Level::Info:    return { 130, 200, 255 };
-            case Level::Success: return { 130, 255, 170 };
-            case Level::Warning: return { 255, 230, 130 };
-            case Level::Error:   return { 255, 130, 130 };
-            case Level::Debug:   return { 200, 160, 255 };
+        case Level::Info:    return { 130, 200, 255 };
+        case Level::Success: return { 130, 255, 170 };
+        case Level::Warning: return { 255, 230, 130 };
+        case Level::Error:   return { 255, 130, 130 };
+        case Level::Debug:   return { 200, 160, 255 };
         }
         return { 255, 255, 255 };
     }
@@ -306,11 +318,11 @@ private:
     {
         switch (L)
         {
-            case Level::Info:    return { 60, 110, 220 };
-            case Level::Success: return { 50, 170, 90 };
-            case Level::Warning: return { 230, 130, 40 };
-            case Level::Error:   return { 200, 30, 60 };
-            case Level::Debug:   return { 120, 70, 200 };
+        case Level::Info:    return { 60, 110, 220 };
+        case Level::Success: return { 50, 170, 90 };
+        case Level::Warning: return { 230, 130, 40 };
+        case Level::Error:   return { 200, 30, 60 };
+        case Level::Debug:   return { 120, 70, 200 };
         }
         return { 255, 255, 255 };
     }
@@ -319,11 +331,11 @@ private:
     {
         switch (L)
         {
-            case Level::Info:    return "[INFO]";
-            case Level::Success: return "[SUCCESS]";
-            case Level::Warning: return "[WARNING]";
-            case Level::Error:   return "[ERROR]";
-            case Level::Debug:   return "[DEBUG]";
+        case Level::Info:    return "[INFO]";
+        case Level::Success: return "[SUCCESS]";
+        case Level::Warning: return "[WARNING]";
+        case Level::Error:   return "[ERROR]";
+        case Level::Debug:   return "[DEBUG]";
         }
         return "[?]";
     }
@@ -396,25 +408,25 @@ private:
         if (!Key) Key = "";
         if (!Text) return;
 
-        const std::uint64_t Hash    = FnvHash(Text);
+        const std::uint64_t Hash = FnvHash(Text);
         const std::uint64_t KeyHash = FnvHash(Key);
-        const std::uint64_t Slot    = KeyHash % kTimeSlots;
-        const std::uint64_t NowMs   = NowMillis();
+        const std::uint64_t Slot = KeyHash % kTimeSlots;
+        const std::uint64_t NowMs = NowMillis();
 
         TimeSlot& S = TimeSlots[Slot];
-        const std::uint64_t LastMs   = S.LastMs.load(std::memory_order_acquire);
+        const std::uint64_t LastMs = S.LastMs.load(std::memory_order_acquire);
         const std::uint64_t LastHash = S.LastHash.load(std::memory_order_acquire);
-        const std::uint64_t StoredKey= S.KeyHash.load(std::memory_order_acquire);
+        const std::uint64_t StoredKey = S.KeyHash.load(std::memory_order_acquire);
 
         const bool DifferentKey = (StoredKey != KeyHash);
         const bool DifferentMsg = (LastHash != Hash);
-        const bool TimedOut     = (NowMs - LastMs) >= MinIntervalMs;
+        const bool TimedOut = (NowMs - LastMs) >= MinIntervalMs;
 
         if (!(DifferentKey || DifferentMsg || TimedOut)) return;
 
-        S.KeyHash.store(KeyHash,  std::memory_order_release);
-        S.LastHash.store(Hash,    std::memory_order_release);
-        S.LastMs.store(NowMs,     std::memory_order_release);
+        S.KeyHash.store(KeyHash, std::memory_order_release);
+        S.LastHash.store(Hash, std::memory_order_release);
+        S.LastMs.store(NowMs, std::memory_order_release);
 
         if (ShowTimestamp.load(std::memory_order_relaxed)) PrintTimestamp();
         if (ShowTag.load(std::memory_order_relaxed)) PrintGradientTag(TagFor(Lv), Lv);
@@ -423,7 +435,7 @@ private:
     }
 
     void TimeImpl(Level Lv, const char* Key, std::uint32_t MinIntervalMs,
-                  const char* Format, va_list Args) noexcept
+        const char* Format, va_list Args) noexcept
     {
         if (!Attached.load(std::memory_order_acquire)) return;
         if (!Key) Key = "";
@@ -432,25 +444,25 @@ private:
         std::vsnprintf(Buffer, sizeof(Buffer), Format, Args);
         Buffer[sizeof(Buffer) - 1] = '\0';
 
-        const std::uint64_t Hash    = FnvHash(Buffer);
+        const std::uint64_t Hash = FnvHash(Buffer);
         const std::uint64_t KeyHash = FnvHash(Key);
-        const std::uint64_t Slot    = KeyHash % kTimeSlots;
-        const std::uint64_t NowMs   = NowMillis();
+        const std::uint64_t Slot = KeyHash % kTimeSlots;
+        const std::uint64_t NowMs = NowMillis();
 
         TimeSlot& S = TimeSlots[Slot];
-        const std::uint64_t LastMs   = S.LastMs.load(std::memory_order_acquire);
+        const std::uint64_t LastMs = S.LastMs.load(std::memory_order_acquire);
         const std::uint64_t LastHash = S.LastHash.load(std::memory_order_acquire);
-        const std::uint64_t StoredKey= S.KeyHash.load(std::memory_order_acquire);
+        const std::uint64_t StoredKey = S.KeyHash.load(std::memory_order_acquire);
 
         const bool DifferentKey = (StoredKey != KeyHash);
         const bool DifferentMsg = (LastHash != Hash);
-        const bool TimedOut     = (NowMs - LastMs) >= MinIntervalMs;
+        const bool TimedOut = (NowMs - LastMs) >= MinIntervalMs;
 
         if (!(DifferentKey || DifferentMsg || TimedOut)) return;
 
-        S.KeyHash.store(KeyHash,  std::memory_order_release);
-        S.LastHash.store(Hash,    std::memory_order_release);
-        S.LastMs.store(NowMs,     std::memory_order_release);
+        S.KeyHash.store(KeyHash, std::memory_order_release);
+        S.LastHash.store(Hash, std::memory_order_release);
+        S.LastMs.store(NowMs, std::memory_order_release);
 
         if (ShowTimestamp.load(std::memory_order_relaxed)) PrintTimestamp();
         if (ShowTag.load(std::memory_order_relaxed)) PrintGradientTag(TagFor(Lv), Lv);
@@ -479,9 +491,9 @@ private:
 
     struct TimeSlot
     {
-        std::atomic<std::uint64_t> KeyHash { 0 };
+        std::atomic<std::uint64_t> KeyHash{ 0 };
         std::atomic<std::uint64_t> LastHash{ 0 };
-        std::atomic<std::uint64_t> LastMs  { 0 };
+        std::atomic<std::uint64_t> LastMs{ 0 };
     };
 
     static constexpr std::size_t kTimeSlots = 256;
@@ -490,6 +502,9 @@ private:
     std::atomic<bool> Attached{ false };
     std::atomic<bool> ShowTimestamp{ true };
     std::atomic<bool> ShowTag{ true };
+#if defined(_WIN32)
+    bool OwnsConsole{ false };
+#endif
 };
 
 inline Console console;
