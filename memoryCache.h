@@ -57,13 +57,6 @@ namespace safety {
 	};
 }
 
-// Usage:
-//   cm cache(drv);
-//   cache.direct<uint64_t>(addr);  // 
-//   cache.fast<uint64_t>(addr);    // uncached  bones, position
-//   cache.medium<uint64_t>(addr);  // 500ms TTL  structural pointers
-//   cache.slow<uint64_t>(addr);    // 15s TTL  FName pool, class keys
-
 class cm {
 public:
 	explicit cm(Memory& mem) : mem_(&mem) {}
@@ -92,28 +85,17 @@ public:
 	T slow(std::uint64_t addr) { return read_cached<T>(addr, slow_cache_, std::chrono::seconds(15)); }
 	bool slow(std::uint64_t addr, void* buf, std::size_t size) { return read_cached(addr, buf, size, slow_cache_, std::chrono::seconds(15)); }
 
+	void evict_stale_fast(std::chrono::steady_clock::duration max_age) {
+		evict_stale(fast_cache_, max_age);
+	}
 	void evict_stale_medium(std::chrono::steady_clock::duration max_age) {
-		const auto cutoff = std::chrono::steady_clock::now() - max_age;
-		for (auto it = medium_cache_.begin(); it != medium_cache_.end(); ) {
-			if (it->second.ts < cutoff)
-				it = medium_cache_.erase(it);
-			else
-				++it;
-		}
+		evict_stale(medium_cache_, max_age);
 	}
-
-
 	void evict_stale_slow(std::chrono::steady_clock::duration max_age) {
-		const auto cutoff = std::chrono::steady_clock::now() - max_age;
-		for (auto it = slow_cache_.begin(); it != slow_cache_.end(); ) {
-			if (it->second.ts < cutoff)
-				it = slow_cache_.erase(it);
-			else
-				++it;
-		}
+		evict_stale(slow_cache_, max_age);
 	}
 
-	void clear() { medium_cache_.clear(); slow_cache_.clear(); }
+	void clear() { fast_cache_.clear(); medium_cache_.clear(); slow_cache_.clear(); }
 
 private:
 	struct entry {
@@ -122,6 +104,15 @@ private:
 		std::size_t size{};
 		std::chrono::steady_clock::time_point ts{};
 	};
+
+	static void evict_stale(std::unordered_map<std::uint64_t, entry>& cache,
+	                        std::chrono::steady_clock::duration max_age) {
+		const auto cutoff = std::chrono::steady_clock::now() - max_age;
+		for (auto it = cache.begin(); it != cache.end(); ) {
+			if (it->second.ts < cutoff) it = cache.erase(it);
+			else                        ++it;
+		}
+	}
 
 	template<typename T, typename Duration>
 	T read_cached(std::uint64_t addr, std::unordered_map<std::uint64_t, entry>& cache, Duration ttl) {
@@ -136,13 +127,14 @@ private:
 			return result;
 		}
 
-		T value = mem_->Read<T>(addr);
+		auto opt = mem_->TryRead<T>(addr);
+		if (!opt) return T{};
 
 		auto& e = cache[addr];
 		if (e.size != n) { e.data = {}; e.size = n; }
-		std::memcpy(e.data.data(), &value, n);
+		std::memcpy(e.data.data(), &*opt, n);
 		e.ts = now;
-		return value;
+		return *opt;
 	}
 
 	template<typename Duration>

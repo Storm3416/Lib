@@ -8,7 +8,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <cstdarg>
 #include <initializer_list>
+#include <optional>
+#include <unordered_map>
 
 using NTSTATUS = LONG;
 #ifndef STATUS_SUCCESS
@@ -20,6 +23,9 @@ using NTSTATUS = LONG;
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 #endif
+
+static_assert(sizeof(void*) == 8,
+    "memory.hpp targets x64 only (PEB offsets and IMAGE_NT_HEADERS64 are hardcoded).");
 
 namespace nt_mem_detail
 {
@@ -72,57 +78,601 @@ using NtClose_t                   = NTSTATUS(NTAPI*)(HANDLE);
 using NtQuerySystemInformation_t  = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
 using NtQueryInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 
+enum class AttachResult
+{
+    Ok,
+    NtApiUnresolved,
+    ProcessNotFound,
+    OpenFailed,
+};
+
+enum class ReadResult
+{
+    Empty,
+    Partial,
+    Full,
+};
+
 class Memory
 {
 public:
-    std::uintptr_t processId = 0;
-    void* processHandle = nullptr;
+    using LogFn = void(*)(const char*);
+    inline static LogFn s_logger = nullptr;
+
+    struct ModuleInfo
+    {
+        std::uintptr_t base = 0;
+        std::size_t    size = 0;
+        bool valid() const noexcept { return base != 0 && size != 0; }
+    };
+
+    struct SectionInfo
+    {
+        std::uintptr_t base = 0;
+        std::size_t    size = 0;
+        bool valid() const noexcept { return base != 0 && size != 0; }
+    };
+
+    static void SetLogger(LogFn fn) noexcept { s_logger = fn; }
+
+    std::uintptr_t Pid()        const noexcept { return processId_; }
+    void*          Handle()     const noexcept { return processHandle_; }
+    bool           IsAttached() const noexcept { return processHandle_ != nullptr; }
+
+    AttachResult AttachEx(const wchar_t* processName) noexcept
+    {
+        if (!ResolveNtApis()) {
+            Log("[memory] ResolveNtApis failed\n");
+            return AttachResult::NtApiUnresolved;
+        }
+
+        const std::uintptr_t newPid = NtFindPidByName(processName);
+        if (!newPid) {
+            Log("[memory] pid not found for target process\n");
+            return AttachResult::ProcessNotFound;
+        }
+
+        nt_mem_detail::OBJECT_ATTRIBUTES oa{};
+        oa.Length = sizeof(oa);
+        nt_mem_detail::CLIENT_ID cid{};
+        cid.UniqueProcess = reinterpret_cast<HANDLE>(newPid);
+        cid.UniqueThread  = nullptr;
+
+        const ACCESS_MASK mask =
+            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION;
+
+        HANDLE newHandle = nullptr;
+        const NTSTATUS st = ntOpen_(&newHandle, mask, &oa, &cid);
+        if (!NT_SUCCESS(st) || !newHandle) {
+            Log("[memory] NtOpenProcess failed status=0x%08lX pid=%lu\n",
+                static_cast<long>(st), static_cast<unsigned long>(newPid));
+            return AttachResult::OpenFailed;
+        }
+
+        Detach();
+        processId_     = newPid;
+        processHandle_ = newHandle;
+
+        Log("[memory] Attach OK pid=%lu mask=0x%lX\n",
+            static_cast<unsigned long>(processId_), static_cast<unsigned long>(mask));
+        return AttachResult::Ok;
+    }
+
+    bool Attach(const wchar_t* processName) noexcept
+    {
+        return AttachEx(processName) == AttachResult::Ok;
+    }
+
+    void Detach() noexcept
+    {
+        if (processHandle_) {
+            if (ntClose_) ntClose_(processHandle_);
+            else          ::CloseHandle(processHandle_);
+            processHandle_ = nullptr;
+            processId_     = 0;
+            scanCache_.clear();
+        }
+    }
+
+    std::uintptr_t GetModuleAddress(const wchar_t* moduleName) const noexcept
+    {
+        return PebFindModule(moduleName).base;
+    }
+
+    ModuleInfo GetModuleInfo(const wchar_t* moduleName) const noexcept
+    {
+        return PebFindModule(moduleName);
+    }
+
+    SectionInfo GetSection(const wchar_t* moduleName, const char* sectionName) const noexcept
+    {
+        SectionInfo out{};
+        const ModuleInfo mod = GetModuleInfo(moduleName);
+        if (!mod.valid() || !sectionName) return out;
+
+        IMAGE_DOS_HEADER dos{};
+        if (!NtRead(mod.base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) return out;
+
+        IMAGE_NT_HEADERS64 nt{};
+        if (!NtRead(mod.base + dos.e_lfanew, &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE) return out;
+
+        const std::uintptr_t sectionTable = mod.base + dos.e_lfanew
+            + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + nt.FileHeader.SizeOfOptionalHeader;
+
+        IMAGE_SECTION_HEADER hdr{};
+        for (WORD i = 0; i < nt.FileHeader.NumberOfSections; ++i) {
+            if (!NtRead(sectionTable + i * sizeof(IMAGE_SECTION_HEADER), &hdr, sizeof(hdr))) break;
+            if (std::strncmp(reinterpret_cast<const char*>(hdr.Name), sectionName, IMAGE_SIZEOF_SHORT_NAME) == 0) {
+                out.base = mod.base + hdr.VirtualAddress;
+                out.size = hdr.Misc.VirtualSize ? hdr.Misc.VirtualSize : hdr.SizeOfRawData;
+                return out;
+            }
+        }
+        return out;
+    }
+
+    template <typename T>
+    T Read(std::uintptr_t address) const noexcept
+    {
+        T value = {};
+        NtRead(address, &value, sizeof(T));
+        return value;
+    }
+
+    template <typename T>
+    std::optional<T> TryRead(std::uintptr_t address) const noexcept
+    {
+        T value = {};
+        if (!NtRead(address, &value, sizeof(T))) return std::nullopt;
+        return value;
+    }
+
+    bool ReadRaw(std::uintptr_t address, void* buffer, size_t size) const noexcept
+    {
+        return NtRead(address, buffer, size);
+    }
+
+    std::string ReadString(std::uintptr_t address, size_t size = 32) const
+    {
+        if (!size) return {};
+        std::vector<char> buffer(size + 1, '\0');
+        NtRead(address, buffer.data(), size);
+        return std::string(buffer.data(), strnlen(buffer.data(), size));
+    }
+
+    template <typename T>
+    bool Write(std::uintptr_t address, const T& value) const noexcept
+    {
+        return NtWrite(address, &value, sizeof(T));
+    }
+
+    bool WriteRaw(std::uintptr_t address, const void* buffer, size_t size) const noexcept
+    {
+        return NtWrite(address, buffer, size);
+    }
+
+    std::uintptr_t FindStringA(const wchar_t* moduleName, const char* needle) const noexcept
+    {
+        if (!needle) return 0;
+        const SectionInfo rdata = GetSection(moduleName, ".rdata");
+        if (!rdata.valid()) return 0;
+
+        const std::size_t nlen = std::strlen(needle);
+        if (!nlen || nlen > rdata.size) return 0;
+
+        ReadResult coverage = ReadResult::Empty;
+        const auto* bufPtr = GetOrLoadRange(rdata.base, rdata.size, &coverage);
+        if (!bufPtr || coverage == ReadResult::Empty) return 0;
+        const auto& buf = *bufPtr;
+
+        const std::uint8_t* p     = buf.data();
+        const std::size_t   last  = buf.size() - nlen;
+        const std::uint8_t  first = static_cast<std::uint8_t>(needle[0]);
+        for (std::size_t i = 0; i <= last; ++i) {
+            if (p[i] != first) continue;
+            if (std::memcmp(p + i, needle, nlen) != 0) continue;
+            if (i + nlen < buf.size() && p[i + nlen] != 0) continue;
+            return rdata.base + i;
+        }
+        return 0;
+    }
+
+    std::uintptr_t FindRipXrefTo(const wchar_t* moduleName, std::uintptr_t targetVa) const noexcept
+    {
+        if (!targetVa) return 0;
+        const SectionInfo text = GetSection(moduleName, ".text");
+        if (!text.valid() || text.size < 7) return 0;
+
+        ReadResult coverage = ReadResult::Empty;
+        const auto* bufPtr = GetOrLoadRange(text.base, text.size, &coverage);
+        if (!bufPtr || coverage == ReadResult::Empty) return 0;
+        const auto& buf = *bufPtr;
+
+        const std::uint8_t* p    = buf.data();
+        const std::size_t   last = text.size - 7;
+
+        for (std::size_t i = 0; i <= last; ++i) {
+            const std::uint8_t b0 = p[i];
+            const std::uint8_t b1 = p[i + 1];
+            const std::uint8_t b2 = p[i + 2];
+
+            const bool         rex   = (b0 & 0xF0) == 0x40;
+            const std::uint8_t opc   = rex ? b1 : b0;
+            const std::uint8_t modrm = rex ? b2 : b1;
+            const std::size_t  off   = rex ? 3  : 2;
+
+            if (opc != 0x8D && opc != 0x8B) continue;
+            if ((modrm & 0xC7) != 0x05)     continue;
+            if (i + off + 4 > text.size)    continue;
+
+            std::int32_t disp;
+            std::memcpy(&disp, p + i + off, sizeof(disp));
+            const std::size_t    instrLen = off + 4;
+            const std::uintptr_t resolved = text.base + i + instrLen + disp;
+            if (resolved == targetVa) return text.base + i;
+        }
+        return 0;
+    }
+
+    std::uintptr_t WalkBackToFunctionStart(const wchar_t* moduleName, std::uintptr_t xrefVa,
+                                          std::size_t maxBack = 0x2000) const noexcept
+    {
+        const SectionInfo text = GetSection(moduleName, ".text");
+        if (!text.valid()) return 0;
+        if (xrefVa < text.base || xrefVa >= text.base + text.size) return 0;
+
+        const std::size_t off  = xrefVa - text.base;
+        const std::size_t look = (off < maxBack) ? off : maxBack;
+        if (look < 2) return 0;
+
+        std::vector<std::uint8_t> buf(look);
+        if (!NtRead(xrefVa - look, buf.data(), look)) return 0;
+
+        for (std::size_t i = look; i >= 2; --i) {
+            if (buf[i - 1] == 0xCC && buf[i - 2] == 0xCC) {
+                return (xrefVa - look) + i;
+            }
+        }
+        return 0;
+    }
+
+    std::uintptr_t FindByStringXref(const wchar_t* moduleName, const char* needle,
+                                    bool walkBackToFnStart = true) const noexcept
+    {
+        const std::uintptr_t strVa = FindStringA(moduleName, needle);
+        if (!strVa) {
+            Log("[xref] string=\"%s\" status=not_found\n", needle);
+            return 0;
+        }
+
+        const std::uintptr_t xref = FindRipXrefTo(moduleName, strVa);
+        if (!xref) {
+            Log("[xref] string=\"%s\" strva=%p status=no_xref\n",
+                needle, reinterpret_cast<void*>(strVa));
+            return 0;
+        }
+
+        if (!walkBackToFnStart) {
+            Log("[xref] string=\"%s\" strva=%p xref=%p\n",
+                needle, reinterpret_cast<void*>(strVa), reinterpret_cast<void*>(xref));
+            return xref;
+        }
+
+        const std::uintptr_t fn = WalkBackToFunctionStart(moduleName, xref);
+        if (!fn) {
+            Log("[xref] string=\"%s\" xref=%p fn=not_found\n",
+                needle, reinterpret_cast<void*>(xref));
+            return xref;
+        }
+        Log("[xref] string=\"%s\" strva=%p xref=%p fn=%p\n",
+            needle, reinterpret_cast<void*>(strVa), reinterpret_cast<void*>(xref),
+            reinterpret_cast<void*>(fn));
+        return fn;
+    }
+
+    static bool ParseIdaPattern(const std::string& pattern,
+                                std::vector<std::uint8_t>& bytes,
+                                std::vector<std::uint8_t>& mask) noexcept
+    {
+        bytes.clear();
+        mask.clear();
+
+        auto hexVal = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+            return -1;
+        };
+
+        const char* p   = pattern.c_str();
+        const char* end = p + pattern.size();
+        while (p < end) {
+            while (p < end && (*p == ' ' || *p == '\t')) ++p;
+            if (p >= end) break;
+
+            if (*p == '?') {
+                ++p;
+                if (p < end && *p == '?') ++p;
+                if (p < end && *p == '?') return false;
+                bytes.push_back(0);
+                mask.push_back(0);
+                continue;
+            }
+
+            const int hi = hexVal(*p++);
+            if (hi < 0) return false;
+            std::uint8_t b = static_cast<std::uint8_t>(hi);
+            if (p < end && *p != ' ' && *p != '\t') {
+                const int lo = hexVal(*p++);
+                if (lo < 0) return false;
+                b = static_cast<std::uint8_t>((hi << 4) | lo);
+            }
+            bytes.push_back(b);
+            mask.push_back(1);
+        }
+        return !bytes.empty();
+    }
+
+    std::uintptr_t PatternScan(const wchar_t* moduleName, const std::string& idaPattern) const noexcept
+    {
+        const ModuleInfo mod = GetModuleInfo(moduleName);
+        if (!mod.valid()) return 0;
+
+        std::vector<std::uint8_t> bytes, mask;
+        if (!ParseIdaPattern(idaPattern, bytes, mask)) return 0;
+        if (bytes.size() > mod.size) return 0;
+
+        ReadResult coverage = ReadResult::Empty;
+        const auto* bufPtr = GetOrLoadRange(mod.base, mod.size, &coverage);
+        if (!bufPtr || coverage == ReadResult::Empty) return 0;
+        const auto& buf = *bufPtr;
+
+        const std::size_t   patLen = bytes.size();
+        const std::size_t   last   = buf.size() - patLen;
+        const std::uint8_t* b = buf.data();
+        const std::uint8_t* p = bytes.data();
+        const std::uint8_t* m = mask.data();
+
+        for (std::size_t i = 0; i <= last; ++i) {
+            std::size_t j = 0;
+            for (; j < patLen; ++j) {
+                if (m[j] && b[i + j] != p[j]) break;
+            }
+            if (j == patLen) return mod.base + i;
+        }
+        return 0;
+    }
+
+    std::uintptr_t PatternScan(const std::string& moduleName, const std::string& idaPattern) const noexcept
+    {
+        const std::wstring w(moduleName.begin(), moduleName.end());
+        return PatternScan(w.c_str(), idaPattern);
+    }
+
+    std::uintptr_t ResolveRel32(std::uintptr_t instrAddr, int dispOffset = 3, int instrLen = 7) const noexcept
+    {
+        if (!instrAddr) return 0;
+        const auto disp = TryRead<std::int32_t>(instrAddr + dispOffset);
+        if (!disp) return 0;
+        return instrAddr + instrLen + *disp;
+    }
+
+    std::uintptr_t PatternScanRel32(const wchar_t* moduleName, const std::string& idaPattern,
+                                    int dispOffset = 3, int instrLen = 7) const noexcept
+    {
+        const std::uintptr_t addr = PatternScan(moduleName, idaPattern);
+        if (!addr) return 0;
+        return ResolveRel32(addr, dispOffset, instrLen);
+    }
+
+    static std::string BytesToIda(const std::vector<std::uint8_t>& bytes, const std::string& mask) noexcept
+    {
+        std::string out;
+        char tmp[8];
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            const bool wild = (i < mask.size()) && (mask[i] == '?' || mask[i] == '0');
+            if (wild) out += "? ";
+            else { sprintf_s(tmp, sizeof(tmp), "%02X ", bytes[i]); out += tmp; }
+        }
+        if (!out.empty() && out.back() == ' ') out.pop_back();
+        return out;
+    }
+
+    static std::string BytesToIda(const std::vector<std::uint8_t>& bytes) noexcept
+    {
+        std::string out;
+        char tmp[8];
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            sprintf_s(tmp, sizeof(tmp), "%02X ", bytes[i]);
+            out += tmp;
+        }
+        if (!out.empty() && out.back() == ' ') out.pop_back();
+        return out;
+    }
+
+    std::uintptr_t FindSig(const wchar_t* moduleName, const std::string& idaPattern) const noexcept
+    {
+        return PatternScan(moduleName, idaPattern);
+    }
+
+    std::uintptr_t FindSig(const wchar_t* moduleName,
+                           std::initializer_list<std::uint8_t> bytes,
+                           const std::string& mask) const noexcept
+    {
+        return PatternScan(moduleName, BytesToIda(std::vector<std::uint8_t>(bytes), mask));
+    }
+
+    std::uintptr_t FindSig(const wchar_t* moduleName,
+                           std::initializer_list<std::uint8_t> bytes) const noexcept
+    {
+        return PatternScan(moduleName, BytesToIda(std::vector<std::uint8_t>(bytes)));
+    }
+
+    std::uintptr_t CreateSigIda(std::uintptr_t address,
+                                const wchar_t* moduleName,
+                                std::size_t maxLen = 64) const noexcept
+    {
+        if (!address) { Log("[sig] null address\n"); return 0; }
+
+        auto buildPattern = [&](std::size_t len) -> std::string
+        {
+            std::vector<std::uint8_t> buf(len);
+            if (!ReadRaw(address, buf.data(), len)) return {};
+
+            std::vector<bool> wild(len, false);
+
+            auto wildcardDisp32 = [&](std::size_t start) {
+                for (std::size_t k = 0; k < 4 && start + k < len; ++k) wild[start + k] = true;
+            };
+            auto isModrmRip = [](std::uint8_t b) { return (b & 0xC7) == 0x05; };
+            auto isRex      = [](std::uint8_t b) { return (b & 0xF0) == 0x40; };
+            auto isSsePfx   = [](std::uint8_t b) { return b == 0xF2 || b == 0xF3 || b == 0x66; };
+
+            for (std::size_t i = 0; i < len; ++i) {
+                std::size_t p = i;
+                if (p < len && isSsePfx(buf[p])) ++p;
+                if (p < len && isRex(buf[p]))    ++p;
+
+                bool twoByte = false;
+                if (p < len && buf[p] == 0x0F) { twoByte = true; ++p; }
+
+                if (p + 1 < len) {
+                    const std::uint8_t opc   = buf[p];
+                    const std::uint8_t modrm = buf[p + 1];
+
+                    bool goodOpc = false;
+                    if (twoByte) {
+                        if (opc >= 0x10 && opc <= 0x17) goodOpc = true;
+                        if (opc == 0x28 || opc == 0x29) goodOpc = true;
+                        if (opc == 0x6E || opc == 0x6F) goodOpc = true;
+                        if (opc == 0x7E || opc == 0x7F) goodOpc = true;
+                    } else {
+                        switch (opc) {
+                        case 0x8B: case 0x8D: case 0x89:
+                        case 0x39: case 0x3B:
+                        case 0xC7: case 0xFF:
+                            goodOpc = true; break;
+                        default: break;
+                        }
+                    }
+
+                    if (goodOpc && isModrmRip(modrm)) {
+                        wildcardDisp32(p + 2);
+                        i = p + 1;
+                    }
+                }
+
+                if (i + 5 < len && buf[i] == 0x0F && (buf[i + 1] & 0xF0) == 0x80)
+                    for (std::size_t k = 2; k <= 5; ++k) wild[i + k] = true;
+
+                if (i + 4 < len && (buf[i] == 0xE8 || buf[i] == 0xE9))
+                    for (std::size_t k = 1; k <= 4; ++k) wild[i + k] = true;
+            }
+
+            std::string out;
+            char tmp[8];
+            for (std::size_t i = 0; i < len; ++i) {
+                if (wild[i]) out += "? ";
+                else { sprintf_s(tmp, sizeof(tmp), "%02X ", buf[i]); out += tmp; }
+            }
+            if (!out.empty() && out.back() == ' ') out.pop_back();
+            return out;
+        };
+
+        std::string    best;
+        std::uintptr_t match = 0;
+        for (std::size_t len = 12; len <= maxLen; len += 4) {
+            std::string sig = buildPattern(len);
+            if (sig.empty()) continue;
+            if (PatternScan(moduleName, sig) == address) {
+                best  = sig;
+                match = address;
+                break;
+            }
+        }
+
+        if (match) Log("[sig] %p  ->  \"%s\"\n", reinterpret_cast<void*>(address), best.c_str());
+        else       Log("[sig] %p  no unique sig within %zu bytes\n", reinterpret_cast<void*>(address), maxLen);
+
+        return match;
+    }
+
+    std::uintptr_t CreateSigIDA(std::uintptr_t address,
+                                const wchar_t* moduleName,
+                                std::size_t maxLen = 64) const noexcept
+    {
+        return CreateSigIda(address, moduleName, maxLen);
+    }
+
+    void ClearScanCache() const noexcept { scanCache_.clear(); }
 
 private:
-    NtReadVirtualMemory_t       ntRead       = nullptr;
-    NtWriteVirtualMemory_t      ntWrite      = nullptr;
-    NtOpenProcess_t             ntOpen       = nullptr;
-    NtClose_t                   ntClose      = nullptr;
-    NtQuerySystemInformation_t  ntQuerySys   = nullptr;
-    NtQueryInformationProcess_t ntQueryProc  = nullptr;
+    std::uintptr_t processId_     = 0;
+    void*          processHandle_ = nullptr;
+
+    NtReadVirtualMemory_t       ntRead_       = nullptr;
+    NtWriteVirtualMemory_t      ntWrite_      = nullptr;
+    NtOpenProcess_t             ntOpen_       = nullptr;
+    NtClose_t                   ntClose_      = nullptr;
+    NtQuerySystemInformation_t  ntQuerySys_   = nullptr;
+    NtQueryInformationProcess_t ntQueryProc_  = nullptr;
+
+    struct ScanCacheEntry
+    {
+        std::size_t               size = 0;
+        std::vector<std::uint8_t> data;
+        ReadResult                coverage = ReadResult::Empty;
+    };
+    mutable std::unordered_map<std::uintptr_t, ScanCacheEntry> scanCache_;
+
+    static void Log(const char* fmt, ...) noexcept
+    {
+        if (!s_logger) return;
+        char buf[512];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, args);
+        va_end(args);
+        s_logger(buf);
+    }
 
     bool ResolveNtApis() noexcept
     {
-        if (ntRead && ntWrite && ntOpen && ntClose && ntQuerySys && ntQueryProc) return true;
+        if (ntRead_ && ntWrite_ && ntOpen_ && ntClose_ && ntQuerySys_ && ntQueryProc_) return true;
 
-        HMODULE ntdll = ::GetModuleHandleA("ntdll.dll");
-        if (!ntdll) ntdll = ::LoadLibraryA("ntdll.dll");
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (!ntdll) ntdll = LoadLibraryA("ntdll.dll");
         if (!ntdll) return false;
 
-        ntRead      = reinterpret_cast<NtReadVirtualMemory_t>      (::GetProcAddress(ntdll, "NtReadVirtualMemory"));
-        ntWrite     = reinterpret_cast<NtWriteVirtualMemory_t>     (::GetProcAddress(ntdll, "NtWriteVirtualMemory"));
-        ntOpen      = reinterpret_cast<NtOpenProcess_t>            (::GetProcAddress(ntdll, "NtOpenProcess"));
-        ntClose     = reinterpret_cast<NtClose_t>                  (::GetProcAddress(ntdll, "NtClose"));
-        ntQuerySys  = reinterpret_cast<NtQuerySystemInformation_t> (::GetProcAddress(ntdll, "NtQuerySystemInformation"));
-        ntQueryProc = reinterpret_cast<NtQueryInformationProcess_t>(::GetProcAddress(ntdll, "NtQueryInformationProcess"));
+        ntRead_      = reinterpret_cast<NtReadVirtualMemory_t>      (GetProcAddress(ntdll, "NtReadVirtualMemory"));
+        ntWrite_     = reinterpret_cast<NtWriteVirtualMemory_t>     (GetProcAddress(ntdll, "NtWriteVirtualMemory"));
+        ntOpen_      = reinterpret_cast<NtOpenProcess_t>            (GetProcAddress(ntdll, "NtOpenProcess"));
+        ntClose_     = reinterpret_cast<NtClose_t>                  (GetProcAddress(ntdll, "NtClose"));
+        ntQuerySys_  = reinterpret_cast<NtQuerySystemInformation_t> (GetProcAddress(ntdll, "NtQuerySystemInformation"));
+        ntQueryProc_ = reinterpret_cast<NtQueryInformationProcess_t>(GetProcAddress(ntdll, "NtQueryInformationProcess"));
 
-        return ntRead && ntWrite && ntOpen && ntClose && ntQuerySys && ntQueryProc;
+        return ntRead_ && ntWrite_ && ntOpen_ && ntClose_ && ntQuerySys_ && ntQueryProc_;
     }
 
-    bool NtRead(const std::uintptr_t address, void* buffer, size_t size) const noexcept
+    bool NtRead(std::uintptr_t address, void* buffer, size_t size) const noexcept
     {
-        if (!processHandle || !ntRead) return false;
+        if (!processHandle_ || !ntRead_) return false;
         SIZE_T bytesRead = 0;
-        const NTSTATUS st = ntRead(processHandle, reinterpret_cast<PVOID>(address), buffer, size, &bytesRead);
+        const NTSTATUS st = ntRead_(processHandle_, reinterpret_cast<PVOID>(address), buffer, size, &bytesRead);
         return NT_SUCCESS(st) && bytesRead == size;
     }
 
-    bool NtWrite(const std::uintptr_t address, const void* buffer, size_t size) const noexcept
+    bool NtWrite(std::uintptr_t address, const void* buffer, size_t size) const noexcept
     {
-        if (!processHandle || !ntWrite) return false;
+        if (!processHandle_ || !ntWrite_) return false;
         SIZE_T bytesWritten = 0;
-        const NTSTATUS st = ntWrite(processHandle, reinterpret_cast<PVOID>(address), const_cast<PVOID>(buffer), size, &bytesWritten);
+        const NTSTATUS st = ntWrite_(processHandle_, reinterpret_cast<PVOID>(address), const_cast<PVOID>(buffer), size, &bytesWritten);
         return NT_SUCCESS(st) && bytesWritten == size;
     }
 
     std::uintptr_t NtFindPidByName(const wchar_t* processName) const noexcept
     {
-        if (!ntQuerySys || !processName) return 0;
+        if (!ntQuerySys_ || !processName) return 0;
 
         ULONG cb = 0x40000;
         std::vector<BYTE> buf;
@@ -130,7 +680,7 @@ private:
         for (int tries = 0; tries < 6 && st == STATUS_INFO_LENGTH_MISMATCH; ++tries) {
             buf.assign(cb, 0);
             ULONG need = 0;
-            st = ntQuerySys(5, buf.data(), cb, &need);
+            st = ntQuerySys_(5, buf.data(), cb, &need);
             if (st == STATUS_INFO_LENGTH_MISMATCH) cb = (need ? need : cb * 2) + 0x4000;
         }
         if (!NT_SUCCESS(st)) return 0;
@@ -151,73 +701,14 @@ private:
         return 0;
     }
 
-public:
-
-    bool Attach(const wchar_t* processName) noexcept
-    {
-        if (!ResolveNtApis()) {
-            std::printf("[memory] ResolveNtApis failed\n");
-            std::fflush(stdout);
-            return false;
-        }
-
-        processId = NtFindPidByName(processName);
-        if (!processId) {
-            return false;
-        }
-
-        nt_mem_detail::OBJECT_ATTRIBUTES oa{};
-        oa.Length = sizeof(oa);
-        nt_mem_detail::CLIENT_ID cid{};
-        cid.UniqueProcess = reinterpret_cast<HANDLE>(processId);
-        cid.UniqueThread  = nullptr;
-
-        const ACCESS_MASK mask = PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION;
-
-        HANDLE h = nullptr;
-        const NTSTATUS st = ntOpen(&h, mask, &oa, &cid);
-        if (!NT_SUCCESS(st) || !h) {
-            std::printf("[memory] NtOpenProcess failed status=0x%08lX pid=%lu\n", static_cast<long>(st), static_cast<unsigned long>(processId));
-            std::fflush(stdout);
-            processId = 0;
-            return false;
-        }
-        processHandle = h;
-
-        std::printf("[memory] Attach OK  pid=%lu  mask=0x%lX  (NtQuerySystemInformation + NtOpenProcess)\n", static_cast<unsigned long>(processId), static_cast<unsigned long>(mask));
-        std::fflush(stdout);
-        return true;
-    }
-
-    void Detach() noexcept
-    {
-        if (processHandle)
-        {
-            if (ntClose) ntClose(processHandle);
-            else         ::CloseHandle(processHandle);
-            processHandle = nullptr;
-            processId = 0;
-        }
-    }
-
-    struct ModuleInfo {
-        std::uintptr_t base = 0;
-        std::size_t    size = 0;
-        bool valid() const noexcept { return base != 0 && size != 0; }
-    };
-
-private:
     ModuleInfo PebFindModule(const wchar_t* moduleName) const noexcept
     {
         ModuleInfo out{};
-        if (!processHandle || !ntQueryProc || !moduleName) return out;
+        if (!processHandle_ || !ntQueryProc_ || !moduleName) return out;
 
         PROCESS_BASIC_INFORMATION pbi{};
         ULONG ret = 0;
-        if (!NT_SUCCESS(ntQueryProc(processHandle, 0,
-                                    &pbi, sizeof(pbi), &ret)) || !pbi.PebBaseAddress) {
-            return out;
-        }
+        if (!NT_SUCCESS(ntQueryProc_(processHandle_, 0, &pbi, sizeof(pbi), &ret)) || !pbi.PebBaseAddress) return out;
 
         std::uintptr_t ldrAddr = 0;
         if (!NtRead(reinterpret_cast<std::uintptr_t>(pbi.PebBaseAddress) + 0x18, &ldrAddr, sizeof(ldrAddr)) || !ldrAddr) return out;
@@ -254,451 +745,54 @@ private:
         return out;
     }
 
-public:
-    std::uintptr_t GetModuleAddress(const wchar_t* moduleName) const noexcept
+    ReadResult ReadChunkedFallback(std::uintptr_t addr, void* out, std::size_t size) const noexcept
     {
-        return PebFindModule(moduleName).base;
-    }
+        if (!size) return ReadResult::Empty;
+        if (NtRead(addr, out, size)) return ReadResult::Full;
 
-    ModuleInfo GetModuleInfo(const wchar_t* moduleName) const noexcept
-    {
-        return PebFindModule(moduleName);
-    }
-
-    struct SectionInfo {
-        std::uintptr_t base = 0;
-        std::size_t    size = 0;
-        bool valid() const noexcept { return base != 0 && size != 0; }
-    };
-
-    SectionInfo GetSection(const wchar_t* ModuleName, const char* SectionName) const noexcept
-    {
-        SectionInfo Out{};
-        const ModuleInfo Mod = GetModuleInfo(ModuleName);
-        if (!Mod.valid() || !SectionName) return Out;
-
-        IMAGE_DOS_HEADER Dos{};
-        if (!NtRead(Mod.base, &Dos, sizeof(Dos)) || Dos.e_magic != IMAGE_DOS_SIGNATURE) return Out;
-
-        IMAGE_NT_HEADERS64 Nt{};
-        if (!NtRead(Mod.base + Dos.e_lfanew, &Nt, sizeof(Nt)) || Nt.Signature != IMAGE_NT_SIGNATURE) return Out;
-
-        const std::uintptr_t SectionTable = Mod.base + Dos.e_lfanew
-            + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + Nt.FileHeader.SizeOfOptionalHeader;
-
-        IMAGE_SECTION_HEADER Hdr{};
-        for (WORD I = 0; I < Nt.FileHeader.NumberOfSections; ++I) {
-            if (!NtRead(SectionTable + I * sizeof(IMAGE_SECTION_HEADER), &Hdr, sizeof(Hdr))) break;
-            if (std::strncmp(reinterpret_cast<const char*>(Hdr.Name), SectionName, IMAGE_SIZEOF_SHORT_NAME) == 0) {
-                Out.base = Mod.base + Hdr.VirtualAddress;
-                Out.size = Hdr.Misc.VirtualSize ? Hdr.Misc.VirtualSize : Hdr.SizeOfRawData;
-                return Out;
+        constexpr std::size_t kChunk = 0x100000;
+        std::size_t okChunks    = 0;
+        std::size_t totalChunks = 0;
+        std::size_t off = 0;
+        auto* dst = static_cast<std::uint8_t*>(out);
+        while (off < size) {
+            const std::size_t n = (size - off < kChunk) ? (size - off) : kChunk;
+            ++totalChunks;
+            if (NtRead(addr + off, dst + off, n)) {
+                ++okChunks;
+            } else {
+                std::memset(dst + off, 0xCC, n);
             }
+            off += n;
         }
-        return Out;
+        if (okChunks == 0)               return ReadResult::Empty;
+        if (okChunks == totalChunks)     return ReadResult::Full;
+        return ReadResult::Partial;
     }
 
-private:
-    bool ReadChunkedFallback(std::uintptr_t Addr, void* Out, std::size_t Size) const noexcept
+    const std::vector<std::uint8_t>* GetOrLoadRange(std::uintptr_t base, std::size_t size,
+                                                    ReadResult* outCoverage = nullptr) const noexcept
     {
-        if (NtRead(Addr, Out, Size)) return true;
-        constexpr std::size_t KChunk = 0x100000;
-        bool Any = false;
-        std::size_t Off = 0;
-        while (Off < Size) {
-            const std::size_t N = (Size - Off < KChunk) ? (Size - Off) : KChunk;
-            if (NtRead(Addr + Off, static_cast<std::uint8_t*>(Out) + Off, N)) Any = true;
-            Off += N;
-        }
-        return Any;
-    }
+        if (!base || !size) return nullptr;
 
-public:
-    std::uintptr_t FindStringA(const wchar_t* ModuleName, const char* Needle) const noexcept
-    {
-        if (!Needle) return 0;
-        const SectionInfo Rdata = GetSection(ModuleName, ".rdata");
-        if (!Rdata.valid()) return 0;
-
-        const std::size_t Nlen = std::strlen(Needle);
-        if (!Nlen || Nlen > Rdata.size) return 0;
-
-        std::vector<std::uint8_t> Buf(Rdata.size);
-        if (!ReadChunkedFallback(Rdata.base, Buf.data(), Buf.size())) return 0;
-
-        const std::uint8_t* P = Buf.data();
-        const std::size_t   Last = Buf.size() - Nlen;
-        const std::uint8_t  First = static_cast<std::uint8_t>(Needle[0]);
-        for (std::size_t I = 0; I <= Last; ++I) {
-            if (P[I] != First) continue;
-            if (std::memcmp(P + I, Needle, Nlen) != 0) continue;
-            if (I + Nlen < Buf.size() && P[I + Nlen] != 0) continue;
-            return Rdata.base + I;
-        }
-        return 0;
-    }
-
-    std::uintptr_t FindRipXrefTo(const wchar_t* ModuleName, std::uintptr_t TargetVa) const noexcept
-    {
-        if (!TargetVa) return 0;
-        const SectionInfo Text = GetSection(ModuleName, ".text");
-        if (!Text.valid() || Text.size < 7) return 0;
-
-        std::vector<std::uint8_t> Buf(Text.size);
-        if (!ReadChunkedFallback(Text.base, Buf.data(), Buf.size())) return 0;
-
-        const std::uint8_t* P = Buf.data();
-        const std::size_t   Last = Text.size - 7;
-
-        for (std::size_t I = 0; I <= Last; ++I) {
-            const std::uint8_t B0 = P[I];
-            const std::uint8_t B1 = P[I + 1];
-            const std::uint8_t B2 = P[I + 2];
-
-            const bool         Rex   = (B0 & 0xF0) == 0x40;
-            const std::uint8_t Opc   = Rex ? B1 : B0;
-            const std::uint8_t Modrm = Rex ? B2 : B1;
-            const std::size_t  Off   = Rex ? 3  : 2;
-
-            if (Opc != 0x8D && Opc != 0x8B) continue;
-            if ((Modrm & 0xC7) != 0x05)     continue;
-            if (I + Off + 4 > Text.size)    continue;
-
-            std::int32_t Disp;
-            std::memcpy(&Disp, P + I + Off, sizeof(Disp));
-            const std::size_t    InstrLen = Off + 4;
-            const std::uintptr_t Resolved = Text.base + I + InstrLen + Disp;
-            if (Resolved == TargetVa) return Text.base + I;
-        }
-        return 0;
-    }
-
-    std::uintptr_t WalkBackToFunctionStart(const wchar_t* ModuleName, std::uintptr_t XrefVa, std::size_t MaxBack = 0x2000) const noexcept
-    {
-        const SectionInfo Text = GetSection(ModuleName, ".text");
-        if (!Text.valid()) return 0;
-        if (XrefVa < Text.base || XrefVa >= Text.base + Text.size) return 0;
-
-        const std::size_t Off  = XrefVa - Text.base;
-        const std::size_t Look = (Off < MaxBack) ? Off : MaxBack;
-        if (Look < 2) return 0;
-
-        std::vector<std::uint8_t> Buf(Look);
-        if (!NtRead(XrefVa - Look, Buf.data(), Look)) return 0;
-
-        for (std::size_t I = Look; I >= 2; --I) {
-            if (Buf[I - 1] == 0xCC && Buf[I - 2] == 0xCC) {
-                return (XrefVa - Look) + I;
-            }
-        }
-        return 0;
-    }
-
-    std::uintptr_t FindByStringXref(const wchar_t* ModuleName, const char* Needle, bool WalkBackToFnStart = true) const noexcept
-    {
-        const std::uintptr_t StrVa = FindStringA(ModuleName, Needle);
-        if (!StrVa) {
-            std::printf("[xref] string=\"%s\" status=not_found\n", Needle);
-            return 0;
+        if (auto it = scanCache_.find(base); it != scanCache_.end() && it->second.size == size) {
+            if (outCoverage) *outCoverage = it->second.coverage;
+            return &it->second.data;
         }
 
-        const std::uintptr_t Xref = FindRipXrefTo(ModuleName, StrVa);
-        if (!Xref) {
-            std::printf("[xref] string=\"%s\" strva=%p status=no_xref\n", Needle, reinterpret_cast<void*>(StrVa));
-            return 0;
+        ScanCacheEntry entry;
+        entry.size = size;
+        entry.data.resize(size);
+        entry.coverage = ReadChunkedFallback(base, entry.data.data(), size);
+        if (entry.coverage == ReadResult::Empty) {
+            if (outCoverage) *outCoverage = ReadResult::Empty;
+            return nullptr;
         }
 
-        if (!WalkBackToFnStart) {
-            std::printf("[xref] string=\"%s\" strva=%p xref=%p\n", Needle, reinterpret_cast<void*>(StrVa), reinterpret_cast<void*>(Xref));
-            return Xref;
-        }
-
-        const std::uintptr_t Fn = WalkBackToFunctionStart(ModuleName, Xref);
-        if (!Fn) {
-            std::printf("[xref] string=\"%s\" xref=%p fn=not_found\n", Needle, reinterpret_cast<void*>(Xref));
-            return Xref;
-        }
-        std::printf("[xref] string=\"%s\" strva=%p xref=%p fn=%p\n", Needle, reinterpret_cast<void*>(StrVa), reinterpret_cast<void*>(Xref), reinterpret_cast<void*>(Fn));
-        return Fn;
-    }
-
-    static bool ParseIdaPattern(const std::string& pattern, std::vector<std::uint8_t>& bytes, std::vector<std::uint8_t>& mask) noexcept
-    {
-        bytes.clear();
-        mask.clear();
-
-        auto hex_val = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-            return -1;
-        };
-
-        const char* p = pattern.c_str();
-        const char* end = p + pattern.size();
-        while (p < end) {
-            while (p < end && (*p == ' ' || *p == '\t')) ++p;
-            if (p >= end) break;
-
-            if (*p == '?') {
-                while (p < end && *p == '?') ++p;
-                bytes.push_back(0);
-                mask.push_back(0);
-                continue;
-            }
-
-            const int hi = hex_val(*p++);
-            if (hi < 0) return false;
-            std::uint8_t b = static_cast<std::uint8_t>(hi);
-            if (p < end && *p != ' ' && *p != '\t') {
-                const int lo = hex_val(*p++);
-                if (lo < 0) return false;
-                b = static_cast<std::uint8_t>((hi << 4) | lo);
-            }
-            bytes.push_back(b);
-            mask.push_back(1);
-        }
-        return !bytes.empty();
-    }
-
-    std::uintptr_t PatternScan(const wchar_t* moduleName, const std::string& ida_pattern) const noexcept
-    {
-        const ModuleInfo mod = GetModuleInfo(moduleName);
-        if (!mod.valid()) return 0;
-
-        std::vector<std::uint8_t> bytes, mask;
-        if (!ParseIdaPattern(ida_pattern, bytes, mask)) return 0;
-        if (bytes.size() > mod.size) return 0;
-
-        std::vector<std::uint8_t> buf(mod.size);
-        if (!NtRead(mod.base, buf.data(), buf.size())) {
-            constexpr std::size_t kChunk = 0x100000;
-            std::size_t off = 0;
-            while (off < mod.size) {
-                const std::size_t n = (mod.size - off < kChunk) ? (mod.size - off) : kChunk;
-                NtRead(mod.base + off, buf.data() + off, n);
-                off += n;
-            }
-        }
-
-        const std::size_t pat_len = bytes.size();
-        const std::size_t last    = buf.size() - pat_len;
-        const std::uint8_t* b = buf.data();
-        const std::uint8_t* p = bytes.data();
-        const std::uint8_t* m = mask.data();
-
-        for (std::size_t i = 0; i <= last; ++i) {
-            std::size_t j = 0;
-            for (; j < pat_len; ++j) {
-                if (m[j] && b[i + j] != p[j]) break;
-            }
-            if (j == pat_len) return mod.base + i;
-        }
-        return 0;
-    }
-
-    std::uintptr_t PatternScan(const std::string& moduleName, const std::string& ida_pattern) const noexcept
-    {
-        const std::wstring w(moduleName.begin(), moduleName.end());
-        return PatternScan(w.c_str(), ida_pattern);
-    }
-
-    std::uintptr_t ResolveRel32(std::uintptr_t instr_addr, int disp_offset = 3, int instr_len = 7) const noexcept
-    {
-        if (!instr_addr) return 0;
-        const std::int32_t disp = Read<std::int32_t>(instr_addr + disp_offset);
-        return instr_addr + instr_len + disp;
-    }
-
-    std::uintptr_t PatternScanRel32(const wchar_t* moduleName, const std::string& ida_pattern,
-                                     int disp_offset = 3, int instr_len = 7) const noexcept
-    {
-        std::uintptr_t addr = PatternScan(moduleName, ida_pattern);
-        if (!addr) return 0;
-        return ResolveRel32(addr, disp_offset, instr_len);
-    }
-
-    template <typename T>
-    T Read(const std::uintptr_t address) const noexcept
-    {
-        T value = { };
-        NtRead(address, &value, sizeof(T));
-        return value;
-    }
-
-    bool ReadRaw(const std::uintptr_t address, const void* buffer, size_t size) const noexcept
-    {
-        return NtRead(address, const_cast<void*>(buffer), size);
-    }
-
-    std::string ReadString(std::uintptr_t address, size_t size = 32) const
-    {
-        std::vector<char> buffer(size, '\0');
-        NtRead(address, buffer.data(), size);
-        return std::string(buffer.data());
-    }
-
-    template <typename T>
-    bool Write(const std::uintptr_t address, const T& value) const noexcept
-    {
-        return NtWrite(address, &value, sizeof(T));
-    }
-
-    bool WriteRaw(const std::uintptr_t address, const void* buffer, size_t size) const noexcept
-    {
-        return NtWrite(address, buffer, size);
-    }
-
-
-    static std::string BytesToIda(const std::vector<std::uint8_t>& bytes, const std::string& mask) noexcept
-    {
-        std::string out;
-        char tmp[8];
-        for (std::size_t i = 0; i < bytes.size(); ++i)
-        {
-            const bool wild = (i < mask.size()) && (mask[i] == '?' || mask[i] == '0');
-            if (wild) out += "? ";
-            else { sprintf_s(tmp, sizeof(tmp), "%02X ", bytes[i]); out += tmp; }
-        }
-        if (!out.empty() && out.back() == ' ') out.pop_back();
-        return out;
-    }
-
-    static std::string BytesToIda(const std::vector<std::uint8_t>& bytes) noexcept
-    {
-        std::string out;
-        char tmp[8];
-        for (std::size_t i = 0; i < bytes.size(); ++i)
-        {
-            if (bytes[i] == 0x00) out += "? ";
-            else { sprintf_s(tmp, sizeof(tmp), "%02X ", bytes[i]); out += tmp; }
-        }
-        if (!out.empty() && out.back() == ' ') out.pop_back();
-        return out;
-    }
-
-
-    std::uintptr_t FindSig(const wchar_t* moduleName, const std::string& ida_pattern) const noexcept
-    {
-        return PatternScan(moduleName, ida_pattern);
-    }
-
-    std::uintptr_t FindSig(const wchar_t* moduleName,
-                           std::initializer_list<std::uint8_t> bytes,
-                           const std::string& mask) const noexcept
-    {
-        return PatternScan(moduleName, BytesToIda(std::vector<std::uint8_t>(bytes), mask));
-    }
-
-    std::uintptr_t FindSig(const wchar_t* moduleName,
-                           std::initializer_list<std::uint8_t> bytes) const noexcept
-    {
-        return PatternScan(moduleName, BytesToIda(std::vector<std::uint8_t>(bytes)));
-    }
-
-    std::uintptr_t CreateSigIDA(std::uintptr_t address,
-                                const wchar_t* moduleName,
-                                std::size_t MaxLen = 64) const noexcept
-    {
-        if (!address) { printf("[sig] null address\n"); return 0; }
-
-        auto build_pattern = [&](std::size_t Len) -> std::string
-        {
-            std::vector<std::uint8_t> Buf(Len);
-            if (!ReadRaw(address, Buf.data(), Len)) return {};
-
-            std::vector<bool> Wild(Len, false);
-
-            auto wildcard_disp32 = [&](std::size_t Start)
-            {
-                for (std::size_t k = 0; k < 4 && Start + k < Len; ++k) Wild[Start + k] = true;
-            };
-
-            auto is_modrm_rip = [](std::uint8_t B) { return (B & 0xC7) == 0x05; };
-            auto is_rex       = [](std::uint8_t B) { return (B & 0xF0) == 0x40;  };
-            auto is_sse_pfx   = [](std::uint8_t B) { return B == 0xF2 || B == 0xF3 || B == 0x66; };
-
-            for (std::size_t i = 0; i < Len; ++i)
-            {
-                std::size_t p = i;
-                if (p < Len && is_sse_pfx(Buf[p])) ++p;
-                if (p < Len && is_rex(Buf[p]))     ++p;
-
-                bool two_byte = false;
-                if (p < Len && Buf[p] == 0x0F) { two_byte = true; ++p; }
-
-                if (p + 1 < Len)
-                {
-                    const std::uint8_t Opc   = Buf[p];
-                    const std::uint8_t Modrm = Buf[p + 1];
-
-                    bool good_opc = false;
-                    if (two_byte)
-                    {
-                        if (Opc >= 0x10 && Opc <= 0x17) good_opc = true;
-                        if (Opc == 0x28 || Opc == 0x29) good_opc = true;
-                        if (Opc == 0x6E || Opc == 0x6F) good_opc = true;
-                        if (Opc == 0x7E || Opc == 0x7F) good_opc = true;
-                    }
-                    else
-                    {
-                        switch (Opc)
-                        {
-                        case 0x8B: case 0x8D: case 0x89:
-                        case 0x39: case 0x3B:
-                        case 0xC7: case 0xFF:
-                            good_opc = true; break;
-                        default: break;
-                        }
-                    }
-
-                    if (good_opc && is_modrm_rip(Modrm))
-                    {
-                        wildcard_disp32(p + 2);
-                        i = p + 1;
-                    }
-                }
-
-                if (i + 5 < Len && Buf[i] == 0x0F && (Buf[i + 1] & 0xF0) == 0x80)
-                    for (std::size_t k = 2; k <= 5; ++k) Wild[i + k] = true;
-
-                if (i + 4 < Len && (Buf[i] == 0xE8 || Buf[i] == 0xE9))
-                    for (std::size_t k = 1; k <= 4; ++k) Wild[i + k] = true;
-            }
-
-            std::string Out;
-            char Tmp[8];
-            for (std::size_t i = 0; i < Len; ++i)
-            {
-                if (Wild[i]) Out += "? ";
-                else { sprintf_s(Tmp, sizeof(Tmp), "%02X ", Buf[i]); Out += Tmp; }
-            }
-            if (!Out.empty() && Out.back() == ' ') Out.pop_back();
-            return Out;
-        };
-
-        std::string Best;
-        std::uintptr_t Match = 0;
-
-        for (std::size_t Len = 12; Len <= MaxLen; Len += 4)
-        {
-            std::string Sig = build_pattern(Len);
-            if (Sig.empty()) continue;
-
-            if (PatternScan(moduleName, Sig) == address)
-            {
-                Best  = Sig;
-                Match = address;
-                break;
-            }
-        }
-
-        if (Match)
-            printf("[sig] %p  ->  \"%s\"\n", (void*)address, Best.c_str());
-        else
-            printf("[sig] %p  no unique sig within %zu bytes\n", (void*)address, MaxLen);
-
-        return Match;
+        auto [it, inserted] = scanCache_.insert_or_assign(base, std::move(entry));
+        (void)inserted;
+        if (outCoverage) *outCoverage = it->second.coverage;
+        return &it->second.data;
     }
 };
 

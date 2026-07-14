@@ -4,12 +4,37 @@ Une bibliothèque C++ moderne pour lire/écrire la mémoire d'un processus exter
 
 ## 📋 Table des matières
 
+- [Migration depuis les versions antérieures](#migration-depuis-les-versions-antérieures)
 - [Caractéristiques](#caractéristiques)
 - [Prérequis](#prérequis)
 - [Installation](#installation)
 - [API Référence](#api-référence)
 - [Exemples](#exemples)
+- [Cache multi-TTL (`cm`)](#cache-multi-ttl-cm)
 - [Architecture Interne](#architecture-interne)
+- [Thread-safety](#thread-safety)
+
+---
+
+## 🔀 Migration depuis les versions antérieures
+
+Cette version corrige plusieurs bugs latents et resserre l'API. Les changements observables :
+
+| Avant | Maintenant | Pourquoi |
+|---|---|---|
+| `memory.processId`, `memory.processHandle` publics | `memory.Pid()`, `memory.Handle()`, `memory.IsAttached()` | Empêche l'écriture externe qui bypasse `Detach()` et laisse la classe dans un état incohérent. |
+| `Attach()` détache d'abord, puis ouvre — si l'ouverture échoue on a perdu l'ancien handle | `AttachEx()` est **atomique** : le nouveau handle est ouvert avant que l'ancien soit fermé, et toute erreur laisse l'attachement précédent en place | Handle leak + état zombie éliminés. |
+| `Attach()` retourne `bool` et printf directement | `AttachEx()` retourne `AttachResult` (`Ok` / `NtApiUnresolved` / `ProcessNotFound` / `OpenFailed`) ; `Attach()` reste et renvoie `bool` pour compat | Diagnostiquer un échec sans parser stdout. |
+| Tous les `printf` internes | Callback global via `Memory::SetLogger(fn)` — silencieux par défaut | Une lib low-level ne pollue plus `stdout`. |
+| `Read<T>()` : impossible de distinguer « lecture ratée » et « valeur zéro » | Ajout de `TryRead<T>()` qui retourne `std::optional<T>` ; `Read<T>()` conservé pour la commodité | Détection d'erreur sans sentinelle. |
+| `ReadString(addr, size)` avec `vector<char>(size, '\0')` — OOB si aucun terminateur | `vector<char>(size + 1, '\0')` + `strnlen` explicite | Fin de la lecture au-delà du buffer. |
+| `ReadRaw(addr, const void* buffer, size)` | `ReadRaw(addr, void* buffer, size)` | Un `const_cast` sur un pointeur `const` réel écrivait sur de la mémoire read-only et crashait. |
+| `ParseIdaPattern` consommait `?????` comme un seul wildcard | `?` ou `??` valent un wildcard ; `???`+ est rejeté | Un pattern mal saisi ne se réaligne plus silencieusement. |
+| `FindSig(mod, {bytes})` et `BytesToIda({bytes})` : `0x00` = wildcard implicite | **STRICT** : chaque octet est littéral. Utilise la surcharge avec `mask` pour des wildcards | `0x00` est un opcode/operand légitime — matches faussement positifs éliminés. |
+| `ReadChunkedFallback` remplissait les chunks ratés avec des zéros silencieux | Chunks ratés remplis avec `0xCC` (int3, improbable en data comme en code) ; retourne `ReadResult { Empty, Partial, Full }` | Les scans downstream ne matchent plus des « faux zéros ». |
+| Aucun cache — chaque `PatternScan` re-lisait tout le module (20+ MiB) | Cache module/section par base ; `memory.ClearScanCache()` pour invalider | Coût O(n) sur le premier scan, O(pattern) sur tous les suivants. |
+| `CreateSigIDA` | `CreateSigIda` (nouvelle convention) ; `CreateSigIDA` reste comme alias | Cohérence de nommage. |
+| C++11 accepté, pas d'assert x64 | **C++17 requis**, `static_assert(sizeof(void*) == 8)` | `std::optional`, `inline static`, structured bindings ; les offsets PEB et `IMAGE_NT_HEADERS64` sont x64-only, autant l'expliciter au compile-time. |
 
 ---
 
@@ -20,23 +45,29 @@ Une bibliothèque C++ moderne pour lire/écrire la mémoire d'un processus exter
 ✅ **Recherche de chaînes** dans les sections PE
 ✅ **Reverse engineering** : xrefs, function walking
 ✅ **Génération automatique de signatures** uniques
-✅ **Support PE32/PE64** (DOS, NT headers, sections)
+✅ **Support PE64** (DOS, NT headers, sections)
 ✅ **Parsing du PEB** pour énumération de modules
-✅ **Lectures chunked** (fallback pour grandes allocations)
+✅ **Lectures chunked** avec statut de couverture (`Full` / `Partial` / `Empty`)
+✅ **Cache module/section** partagé entre `FindStringA`, `FindRipXrefTo`, `PatternScan`
+✅ **Logger injectable** — silencieux par défaut
 
 ---
 
 ## 📦 Prérequis
 
-- **OS** : Windows (XP+)
-- **Compilateur** : MSVC 2015+ ou Clang
-- **C++** : C++11 ou supérieur
-- **Permissions** : Accès administrateur ou SeDebugPrivilege
+- **OS** : Windows 7+
+- **Compilateur** : MSVC 2017+ ou Clang (C++17)
+- **C++** : **C++17** ou supérieur (`std::optional`, `inline static`, structured bindings)
+- **Cible** : **x64 uniquement** (contrôlé par `static_assert`)
+- **Permissions** : Accès administrateur ou `SeDebugPrivilege`
 
 ### Headers requis
+
 ```cpp
 #include <Windows.h>
 #include <winternl.h>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 #include <string>
 ```
@@ -46,14 +77,15 @@ Une bibliothèque C++ moderne pour lire/écrire la mémoire d'un processus exter
 ## 🚀 Installation
 
 ### Méthode 1 : Header-only
+
 ```cpp
 #include "memory.hpp"
 
-// Instance globale prête à l'emploi
 memory.Attach(L"target.exe");
 ```
 
 ### Méthode 2 : Intégration dans un projet
+
 ```bash
 git clone https://github.com/Storm3416/Lib
 # Copier memory.hpp dans votre projet
@@ -63,40 +95,81 @@ git clone https://github.com/Storm3416/Lib
 
 ## 📚 API Référence
 
-### Gestion du processus
+### Logger
 
-#### `bool Attach(const wchar_t* processName)`
-Connecte à un processus par son nom.
+#### `static void Memory::SetLogger(LogFn fn)`
+
+Enregistre un callback pour toutes les traces internes (`[memory]`, `[xref]`, `[sig]`). Par défaut, aucun output — parfait pour une lib embarquée. Le callback reçoit une chaîne C nulle-terminée déjà formatée.
+
 ```cpp
-if (memory.Attach(L"notepad.exe")) {
-    printf("Connecté au processus\n");
-}
+Memory::SetLogger([](const char* msg) {
+    std::fputs(msg, stderr);
+});
+// Ou brancher sur spdlog, votre Console::debug, un log file, etc.
 ```
-**Retour** : `true` si succès, `false` sinon
 
 ---
 
-#### `void Detach()`
-Déconnecte du processus et libère les ressources.
+### Gestion du processus
+
+#### `AttachResult AttachEx(const wchar_t* processName)`
+
+Version détaillée. Atomique : si la localisation ou l'ouverture du nouveau processus échoue, l'attachement précédent est préservé.
+
 ```cpp
-memory.Detach();
+enum class AttachResult {
+    Ok,
+    NtApiUnresolved,   // GetModuleHandle("ntdll.dll") ou GetProcAddress ratés
+    ProcessNotFound,   // NtQuerySystemInformation n'a pas trouvé le nom
+    OpenFailed,        // NtOpenProcess a échoué (voir logger pour NTSTATUS)
+};
+
+switch (memory.AttachEx(L"notepad.exe")) {
+case AttachResult::Ok:              /* continuer */         break;
+case AttachResult::ProcessNotFound: /* rerun l'énum */      break;
+case AttachResult::OpenFailed:      /* demander SeDebug */  break;
+case AttachResult::NtApiUnresolved: /* Windows trop vieux */break;
+}
 ```
+
+#### `bool Attach(const wchar_t* processName)`
+
+Raccourci : retourne `true` ssi `AttachEx(...) == AttachResult::Ok`.
+
+```cpp
+if (memory.Attach(L"notepad.exe")) {
+    // ...
+}
+```
+
+#### `void Detach()`
+
+Ferme le handle et vide le cache de scan.
+
+#### `std::uintptr_t Pid() const`
+
+PID du processus attaché, `0` sinon.
+
+#### `void* Handle() const`
+
+Handle brut du processus, `nullptr` sinon. Ne pas fermer directement — utiliser `Detach()`.
+
+#### `bool IsAttached() const`
+
+Sucre pour `Handle() != nullptr`.
 
 ---
 
 ### Modules et Sections
 
 #### `std::uintptr_t GetModuleAddress(const wchar_t* moduleName)`
-Obtient l'adresse de base d'un module chargé.
+
 ```cpp
 auto kernelBase = memory.GetModuleAddress(L"kernel32.dll");
-printf("kernel32.dll base: %p\n", (void*)kernelBase);
 ```
 
----
-
 #### `ModuleInfo GetModuleInfo(const wchar_t* moduleName)`
-Obtient l'adresse et la taille d'un module.
+
 ```cpp
 auto mod = memory.GetModuleInfo(L"kernel32.dll");
 if (mod.valid()) {
@@ -104,424 +177,301 @@ if (mod.valid()) {
 }
 ```
 
----
+#### `SectionInfo GetSection(const wchar_t*, const char*)`
 
-#### `SectionInfo GetSection(const wchar_t* ModuleName, const char* SectionName)`
-Localise une section PE (`.text`, `.rdata`, `.data`, etc).
+Localise une section PE (`.text`, `.rdata`, `.data`, etc.).
+
 ```cpp
-auto textSection = memory.GetSection(L"kernel32.dll", ".text");
-if (textSection.valid()) {
-    printf(".text: %p - %p\n", (void*)textSection.base, 
-           (void*)(textSection.base + textSection.size));
-}
+auto text = memory.GetSection(L"kernel32.dll", ".text");
 ```
 
 ---
 
 ### Recherche et Pattern Scanning
 
-#### `std::uintptr_t FindStringA(const wchar_t* ModuleName, const char* Needle)`
-Cherche une chaîne ASCII dans la section `.rdata`.
+#### `std::uintptr_t FindStringA(const wchar_t*, const char*)`
+
+Cherche une chaîne ASCII dans `.rdata`.
+
 ```cpp
 auto addr = memory.FindStringA(L"kernel32.dll", "LoadLibraryA");
-if (addr) {
-    printf("Chaîne trouvée à: %p\n", (void*)addr);
-}
 ```
 
----
+#### `std::uintptr_t PatternScan(const wchar_t*, const std::string& idaPattern)`
 
-#### `std::uintptr_t PatternScan(const wchar_t* moduleName, const std::string& ida_pattern)`
-Scanner un pattern avec format IDA (hex + wildcards).
+Pattern IDA-style avec wildcards `?` ou `??`.
+
 ```cpp
-// Chercher : push rbp; mov rbp, rsp
 auto func = memory.PatternScan(L"kernel32.dll", "55 8B EC 48 83 EC ??");
-
-// Ou avec std::string pour le module
-auto func2 = memory.PatternScan("kernel32.dll", "55 8B EC");
 ```
 
 **Format des patterns** :
-- `55` = byte exact 0x55
-- `??` = wildcard (n'importe quel byte)
+
+- `55` = byte exact `0x55`
+- `?` ou `??` = un octet wildcard
 - Espaces = séparateurs
+- `???`+ = **erreur** (pas silencieusement collapsé, contrairement aux anciennes versions)
 
----
+#### `std::uintptr_t FindSig(const wchar_t*, const std::string&)`
 
-#### `std::uintptr_t FindSig(const wchar_t* moduleName, const std::string& ida_pattern)`
 Alias de `PatternScan()`.
-```cpp
-auto addr = memory.FindSig(L"kernel32.dll", "E8 ?? ?? ?? ??");  // CALL
-```
 
----
+#### `std::uintptr_t FindSig(const wchar_t*, std::initializer_list<uint8_t> bytes, const std::string& mask)`
 
-#### `std::uintptr_t FindSig(const wchar_t* moduleName, std::initializer_list<std::uint8_t> bytes, const std::string& mask)`
-Cherche un pattern avec liste d'octets et mask.
+Version avec mask explicite pour les wildcards.
+
 ```cpp
 auto addr = memory.FindSig(L"kernel32.dll",
     {0x55, 0x8B, 0xEC, 0x48, 0x83, 0xEC},
     "??????");
 ```
 
----
+#### `std::uintptr_t FindSig(const wchar_t*, std::initializer_list<uint8_t> bytes)` — **STRICT**
 
-#### `std::uintptr_t FindSig(const wchar_t* moduleName, std::initializer_list<std::uint8_t> bytes)`
-Cherche un pattern d'octets (auto-masking des 0x00).
+⚠️ **Breaking change** : cette surcharge sans `mask` traite désormais **chaque octet littéralement**. `0x00` n'est plus un wildcard implicite.
+
 ```cpp
+// Ancien comportement (buggé) : {0x55, 0x00} matchait "55 ??"
+// Nouveau comportement       : {0x55, 0x00} matche "55 00" strictement
 auto addr = memory.FindSig(L"kernel32.dll", {0x55, 0x8B, 0xEC});
+// Pour des wildcards, passer un mask explicite :
+auto addr2 = memory.FindSig(L"kernel32.dll", {0x55, 0x8B, 0xEC}, "xx?");
 ```
 
 ---
 
 ### Reverse Engineering
 
-#### `std::uintptr_t FindRipXrefTo(const wchar_t* ModuleName, std::uintptr_t TargetVa)`
-Trouve une instruction RIP-relative pointant vers une adresse.
+#### `std::uintptr_t FindRipXrefTo(const wchar_t*, std::uintptr_t targetVa)`
+
+Cherche une instruction RIP-relative (`LEA` / `MOV`) pointant vers `targetVa`.
+
+#### `std::uintptr_t WalkBackToFunctionStart(const wchar_t*, std::uintptr_t xrefVa, std::size_t maxBack = 0x2000)`
+
+Remonte à la première paire de `CC CC` (padding int3 entre fonctions).
+
+#### `std::uintptr_t FindByStringXref(const wchar_t*, const char* needle, bool walkBackToFnStart = true)`
+
+Workflow complet : chaîne → xref → fonction.
+
 ```cpp
-auto strAddr = memory.FindStringA(L"app.dll", "error");
-auto xref = memory.FindRipXrefTo(L"app.dll", strAddr);
-// Retourne l'adresse de l'instruction qui référence strAddr
+auto fn = memory.FindByStringXref(L"app.dll", "error occurred", true);
 ```
 
 ---
 
-#### `std::uintptr_t WalkBackToFunctionStart(const wchar_t* ModuleName, std::uintptr_t XrefVa, std::size_t MaxBack)`
-Remonte à la fonction contenant une adresse en cherchant les marqueurs `0xCC`.
+### Lecture / Écriture
+
+#### `template<typename T> T Read(std::uintptr_t address)`
+
+Ignore l'échec — retourne `T{}` en cas d'erreur (**indistinguable** d'une lecture réussie qui vaut zéro).
+
+#### `template<typename T> std::optional<T> TryRead(std::uintptr_t address)` — **NEW**
+
+Distingue échec et zéro.
+
 ```cpp
-auto funcStart = memory.WalkBackToFunctionStart(L"app.dll", 0x140001234, 0x2000);
-printf("Fonction trouvée à: %p\n", (void*)funcStart);
-```
-**Paramètres** :
-- `XrefVa` : adresse où commencer le recherche
-- `MaxBack` : distance maximale à remonter (défaut: 0x2000)
-
----
-
-#### `std::uintptr_t FindByStringXref(const wchar_t* ModuleName, const char* Needle, bool WalkBackToFnStart)`
-Workflow complet : cherche une chaîne → trouve la xref → remonte à la fonction.
-```cpp
-// Cherche "error occurred", trouve la xref, remonte à la fonction
-auto funcAddr = memory.FindByStringXref(L"app.dll", "error occurred", true);
-
-// Sans remontée à la fonction
-auto xrefAddr = memory.FindByStringXref(L"app.dll", "error occurred", false);
-```
-
----
-
-### Lecture/Écriture de Mémoire
-
-#### `template <typename T> T Read(const std::uintptr_t address)`
-Lit une valeur générique.
-```cpp
-int value = memory.Read<int>(0x140000000);
-float pi = memory.Read<float>(0x140001000);
-
-struct MyStruct { int x; float y; };
-MyStruct data = memory.Read<MyStruct>(0x140002000);
-```
-
----
-
-#### `bool ReadRaw(const std::uintptr_t address, const void* buffer, size_t size)`
-Lit des octets bruts.
-```cpp
-std::vector<uint8_t> buffer(256);
-if (memory.ReadRaw(0x140000000, buffer.data(), 256)) {
-    printf("Lecture OK\n");
+if (auto pid = memory.TryRead<std::int32_t>(addr)) {
+    use(*pid);
+} else {
+    // lecture ratée
 }
 ```
 
----
+#### `bool ReadRaw(std::uintptr_t address, void* buffer, size_t size)`
 
-#### `std::string ReadString(std::uintptr_t address, size_t size)`
-Lit une chaîne de caractères (null-terminated).
-```cpp
-std::string text = memory.ReadString(0x140001000, 64);
-printf("Texte: %s\n", text.c_str());
-```
+Signature `void*` — ne jamais passer un `const char*` d'un string littéral.
 
----
+#### `std::string ReadString(std::uintptr_t address, size_t size = 32)`
 
-#### `template <typename T> bool Write(const std::uintptr_t address, const T& value)`
-Écrit une valeur générique.
-```cpp
-memory.Write(0x140000000, 0x12345678);
-memory.Write(0x140000004, 3.14159f);
-```
-**Retour** : `true` si succès, `false` sinon
+Length-safe. Le buffer interne est de taille `size + 1`, et un `strnlen(buffer, size)` borne la construction du `std::string`.
 
----
+#### `template<typename T> bool Write(std::uintptr_t address, const T& value)`
 
-#### `bool WriteRaw(const std::uintptr_t address, const void* buffer, size_t size)`
-Écrit des octets bruts.
-```cpp
-uint8_t patch[] = {0x90, 0x90, 0x90};  // NOPs
-memory.WriteRaw(0x140000000, patch, sizeof(patch));
-```
+#### `bool WriteRaw(std::uintptr_t address, const void* buffer, size_t size)`
 
 ---
 
 ### Résolution d'Adresses
 
-#### `std::uintptr_t ResolveRel32(std::uintptr_t instr_addr, int disp_offset, int instr_len)`
-Résout un déplacement relatif 32-bit (RIP-relative).
-```cpp
-// Instruction RIP-relative : lea rax, [rel msg]
-// À l'adresse 0x140001000, déplacement à offset 3, longueur 7
-auto resolved = memory.ResolveRel32(0x140001000, 3, 7);
-printf("Adresse résolue: %p\n", (void*)resolved);
-```
+#### `std::uintptr_t ResolveRel32(std::uintptr_t instrAddr, int dispOffset = 3, int instrLen = 7)`
 
----
+Utilise `TryRead` en interne — retourne `0` proprement si l'instruction est illisible.
 
-#### `std::uintptr_t PatternScanRel32(const wchar_t* moduleName, const std::string& ida_pattern, int disp_offset, int instr_len)`
-Combine `PatternScan()` + `ResolveRel32()`.
-```cpp
-// Trouve "E8 ?? ?? ?? ??" et résout la cible du CALL
-auto callTarget = memory.PatternScanRel32(L"kernel32.dll", "E8 ?? ?? ?? ??");
-```
+#### `std::uintptr_t PatternScanRel32(const wchar_t*, const std::string&, int dispOffset = 3, int instrLen = 7)`
+
+`PatternScan()` + `ResolveRel32()`.
 
 ---
 
 ### Génération de Signatures
 
-#### `std::uintptr_t CreateSigIDA(std::uintptr_t address, const wchar_t* moduleName, std::size_t MaxLen)`
-Génère automatiquement une signature unique pour une adresse.
-```cpp
-// Crée une signature de max 64 bytes pour l'adresse donnée
-memory.CreateSigIDA(0x140001000, L"kernel32.dll", 64);
-// Affiche : [sig] 0x140001000  ->  "55 8B EC 48 83 EC ?? ??"
-```
+#### `std::uintptr_t CreateSigIda(std::uintptr_t address, const wchar_t* moduleName, std::size_t maxLen = 64)`
 
-Automatiquement :
-- Remplace les déplacements 32-bit par `??`
-- Remplace les destinations CALL/JMP par `??`
-- Remplace les décodeurs SSE par `??`
+Génère une signature IDA unique en wildcardant automatiquement :
 
----
+- Déplacements 32-bit RIP-relatifs
+- Cibles de `CALL` / `JMP` (`E8` / `E9`)
+- `Jcc rel32` (`0F 8x`)
+- Décodeurs SSE (`0F 10..17`, `28`, `29`, `6E`, `6F`, `7E`, `7F` avec préfixes `66`/`F2`/`F3`)
 
-#### `static std::string BytesToIda(const std::vector<std::uint8_t>& bytes, const std::string& mask)`
-Convertit des octets en pattern IDA avec mask personnalisé.
-```cpp
-std::vector<uint8_t> code = {0x55, 0x8B, 0xEC, 0x00, 0x00};
-std::string sig = memory.BytesToIda(code, "??????  ");
-// Résultat : "55 8B EC ? ?"
-```
+L'alias `CreateSigIDA` (majuscules d'origine) reste dispo pour ne pas casser les callers existants.
+
+#### `static std::string BytesToIda(bytes, mask)`
+
+Convertit des octets en pattern IDA avec mask.
+
+#### `static std::string BytesToIda(bytes)` — **STRICT**
+
+⚠️ **Breaking change** : plus d'auto-wildcarding des `0x00`. Chaque octet est littéral.
 
 ---
 
-#### `static std::string BytesToIda(const std::vector<std::uint8_t>& bytes)`
-Convertit des octets en pattern IDA (auto-masking des 0x00).
-```cpp
-std::vector<uint8_t> code = {0x55, 0x8B, 0xEC, 0x00, 0x00};
-std::string sig = memory.BytesToIda(code);
-// Résultat : "55 8B EC ? ?"
-```
+### Cache de scan
+
+#### `void ClearScanCache() const`
+
+Vide le cache module/section utilisé par `FindStringA` / `FindRipXrefTo` / `PatternScan`. À appeler si la cible se réécrit (self-modifying code, injection, hot-patch), sinon `Detach()` s'en charge.
 
 ---
 
 ## 💡 Exemples
 
 ### Exemple 1 : Lire/Écrire simple
+
 ```cpp
 #include "memory.hpp"
 
 int main() {
+    Memory::SetLogger([](const char* msg) { std::fputs(msg, stderr); });
+
     if (!memory.Attach(L"notepad.exe")) {
-        printf("Erreur: impossible de se connecter\n");
         return 1;
     }
 
-    // Lire une valeur
-    int value = memory.Read<int>(0x140000000);
-    printf("Valeur lue: 0x%X\n", value);
-
-    // Écrire une valeur
+    if (auto v = memory.TryRead<int>(0x140000000)) {
+        printf("Lu: 0x%X\n", *v);
+    }
     memory.Write(0x140000000, 0xDEADBEEF);
-    printf("Valeur écrite\n");
 
     memory.Detach();
-    return 0;
 }
 ```
 
 ---
 
 ### Exemple 2 : Trouver une fonction via une chaîne
+
 ```cpp
-#include "memory.hpp"
-
-int main() {
-    memory.Attach(L"myapp.exe");
-
-    // Cherche "error occurred" → trouve xref → remonte à la fonction
-    std::uintptr_t funcAddr = memory.FindByStringXref(
-        L"myapp.dll", 
-        "error occurred", 
-        true  // remontée à la fonction
-    );
-
-    if (funcAddr) {
-        printf("Fonction trouvée à: %p\n", (void*)funcAddr);
-        
-        // Créer une signature pour cette fonction
-        memory.CreateSigIDA(funcAddr, L"myapp.dll", 64);
-    }
-
-    memory.Detach();
-    return 0;
+memory.Attach(L"myapp.exe");
+auto fn = memory.FindByStringXref(L"myapp.dll", "error occurred", true);
+if (fn) {
+    memory.CreateSigIda(fn, L"myapp.dll", 64);
 }
 ```
 
 ---
 
-### Exemple 3 : Pattern scanning
+### Exemple 3 : Pattern scanning avec logger
+
 ```cpp
-#include "memory.hpp"
+Memory::SetLogger([](const char* m){ std::fputs(m, stdout); });
+memory.Attach(L"game.exe");
 
-int main() {
-    memory.Attach(L"game.exe");
-
-    // Chercher une séquence d'instructions
-    // push rbp
-    // mov rbp, rsp
-    // sub rsp, ??
-    auto func = memory.PatternScan(L"game.dll", "55 8B EC 48 83 EC ??");
-
-    if (func) {
-        printf("Fonction trouvée à: %p\n", (void*)func);
-        
-        // Lire les 32 premiers bytes
-        std::vector<uint8_t> buf(32);
-        memory.ReadRaw(func, buf.data(), 32);
-    }
-
-    memory.Detach();
-    return 0;
+auto func = memory.PatternScan(L"game.dll", "55 8B EC 48 83 EC ??");
+if (func) {
+    std::vector<std::uint8_t> buf(32);
+    memory.ReadRaw(func, buf.data(), buf.size());
 }
 ```
 
 ---
 
-### Exemple 4 : Inspection PE
+### Exemple 4 : Attachement atomique et diagnostics
+
 ```cpp
-#include "memory.hpp"
-
-int main() {
-    memory.Attach(L"target.exe");
-
-    // Obtenir les infos du module
-    auto modInfo = memory.GetModuleInfo(L"kernel32.dll");
-    printf("kernel32.dll base: %p\n", (void*)modInfo.base);
-    printf("kernel32.dll size: %zu bytes\n", modInfo.size);
-
-    // Inspecter les sections
-    auto textSection = memory.GetSection(L"kernel32.dll", ".text");
-    auto rdataSection = memory.GetSection(L"kernel32.dll", ".rdata");
-    auto dataSection = memory.GetSection(L"kernel32.dll", ".data");
-
-    printf(".text : %p - %p\n", (void*)textSection.base,
-           (void*)(textSection.base + textSection.size));
-    printf(".rdata: %p - %p\n", (void*)rdataSection.base,
-           (void*)(rdataSection.base + rdataSection.size));
-    printf(".data : %p - %p\n", (void*)dataSection.base,
-           (void*)(dataSection.base + dataSection.size));
-
-    memory.Detach();
-    return 0;
+switch (memory.AttachEx(L"target.exe")) {
+case AttachResult::Ok:              break;
+case AttachResult::NtApiUnresolved: std::fputs("ntdll KO\n", stderr); return 1;
+case AttachResult::ProcessNotFound: std::fputs("cible absente\n", stderr); return 2;
+case AttachResult::OpenFailed:      std::fputs("droit debug requis\n", stderr); return 3;
 }
+```
+
+Si `target.exe` disparaît mais qu'on tente de re-attacher à `other.exe` avec échec, l'ancien handle reste utilisable.
+
+---
+
+### Exemple 5 : Cache multi-TTL
+
+```cpp
+#include "memoryCache.h"
+
+cm cache(memory);
+auto hp = cache.fast<int>(hpAddr);        // 10us  TTL
+auto mp = cache.medium<int>(mpAddr);      // 500ms TTL
+auto pool = cache.slow<uintptr_t>(poolAddr); // 15s TTL
+
+cache.evict_stale_medium(std::chrono::seconds(2));
 ```
 
 ---
 
-### Exemple 5 : Génération automatique de signatures
-```cpp
-#include "memory.hpp"
+## 🧩 Cache multi-TTL (`cm`)
 
-int main() {
-    memory.Attach(L"target.exe");
+`memoryCache.h` fournit deux briques :
 
-    // Supposons qu'on a trouvé une fonction intéressante
-    std::uintptr_t funcAddr = memory.PatternScan(L"target.dll", "E8 ?? ?? ?? ??");
+- **`safety::cached<T>`** : conteneur `atomic<shared_ptr<const T>>` pour publier une valeur immuable lue par plusieurs threads (thread-safe).
+- **`cm`** : cache par-adresse à 4 étages (`direct`, `fast`, `medium`, `slow`, plus l'alias `debit`) qui délègue à `Memory::TryRead` — un read raté ne pollue plus le cache avec des faux zéros.
 
-    if (funcAddr) {
-        // Générer une signature unique
-        printf("\nGénération de signature pour %p...\n", (void*)funcAddr);
-        memory.CreateSigIDA(funcAddr, L"target.dll", 64);
-        
-        // Affiche quelque chose comme:
-        // [sig] 0x140001234  ->  "55 8B EC 48 83 EC ?? ?? 48 89 ??"
-    }
-
-    memory.Detach();
-    return 0;
-}
-```
-
----
-
-### Exemple 6 : Initializer list FindSig
-```cpp
-#include "memory.hpp"
-
-int main() {
-    memory.Attach(L"target.exe");
-
-    // Chercher avec initializer_list
-    auto addr1 = memory.FindSig(L"target.dll", 
-        {0x55, 0x8B, 0xEC, 0x48, 0x83, 0xEC},
-        "??????");
-
-    // Auto-masking (0x00 = wildcard)
-    auto addr2 = memory.FindSig(L"target.dll",
-        {0x55, 0x8B, 0xEC, 0x00, 0x00, 0x48});
-
-    printf("Adresse 1: %p\n", (void*)addr1);
-    printf("Adresse 2: %p\n", (void*)addr2);
-
-    memory.Detach();
-    return 0;
-}
-```
+⚠️ `cm` n'est **pas thread-safe** (les `unordered_map` internes ne le sont pas). Wrap-le dans un mutex ou donne un `cm` par thread.
 
 ---
 
 ## 🏗️ Architecture Interne
 
 ### Structures
-```cpp
-struct ModuleInfo {
-    std::uintptr_t base;   // Adresse de base du module
-    std::size_t size;      // Taille en bytes
-    bool valid() const;    // Vérifiez si les données sont valides
-};
 
-struct SectionInfo {
-    std::uintptr_t base;   // Adresse de base de la section
-    std::size_t size;      // Taille en bytes
-    bool valid() const;    // Vérifiez si les données sont valides
-};
+```cpp
+struct ModuleInfo   { std::uintptr_t base; std::size_t size; bool valid() const; };
+struct SectionInfo  { std::uintptr_t base; std::size_t size; bool valid() const; };
+enum class AttachResult { Ok, NtApiUnresolved, ProcessNotFound, OpenFailed };
+enum class ReadResult   { Empty, Partial, Full };
 ```
 
 ### APIs Natives (ntdll.dll)
-- `NtReadVirtualMemory` : Lire la mémoire externe
-- `NtWriteVirtualMemory` : Écrire la mémoire externe
-- `NtOpenProcess` : Ouvrir un handle de processus
-- `NtClose` : Fermer un handle
-- `NtQuerySystemInformation` : Énumérer les processus
-- `NtQueryInformationProcess` : Obtenir les infos du processus (PEB)
+
+- `NtReadVirtualMemory` — lecture externe
+- `NtWriteVirtualMemory` — écriture externe
+- `NtOpenProcess` — handle du processus
+- `NtClose` — fermeture
+- `NtQuerySystemInformation` — énumération des processus
+- `NtQueryInformationProcess` — accès au PEB
 
 ### Parsing PE
-- **PEB Walking** : Énumération des modules via Process Environment Block
-- **DOS Header** : Localisation de l'en-tête NT
-- **Section Headers** : Récupération des offsets et tailles des sections
 
-### Pattern Scanning
-- **IDA Format** : Support des patterns hex classiques (55 8B EC ??)
-- **Chunked Reading** : Lecture par chunks de 1MB en fallback
-- **Masking** : Wildcards (0x00 ou ??) pour l'adaptation
+- **PEB walking** via `InLoadOrderModuleList` (Ldr+0x10)
+- **DOS header** puis **IMAGE_NT_HEADERS64**
+- **Section table** parcourue linéairement
+
+### Pattern scanning
+
+- **Cache module/section** : chaque section lue une fois via `ReadChunkedFallback`, réutilisée pour les scans suivants
+- **Chunks 1 MiB** : chunks ratés remplis avec `0xCC`
+- **Couverture** exposée : `ReadResult::Full` / `Partial` / `Empty`
+- **Wildcards stricts** : `?` ou `??`, sinon erreur
+
+---
+
+## 🔒 Thread-safety
+
+| Composant | Statut |
+|---|---|
+| `Memory::Attach` / `AttachEx` | À faire depuis un seul thread (typiquement le main) avant de lâcher les workers. |
+| `ResolveNtApis` (interne) | Idempotent — la race de résolution est bénigne (chaque racer écrit les six mêmes pointeurs ntdll), mais serialize le premier `Attach` par sécurité. |
+| `Memory::Read` / `TryRead` / `Write` / `PatternScan` | OK depuis plusieurs threads une fois attaché, tant que **`ClearScanCache`, `Detach` et `AttachEx` ne sont pas en cours**. Le cache de scan est protégé par `mutable` mais pas par un mutex. |
+| `safety::cached<T>` | Thread-safe (atomic shared_ptr, ordering acquire/release). |
+| `cm` | **Non** thread-safe — mutex externe ou un `cm` par thread. |
 
 ---
 
@@ -533,11 +483,7 @@ Usages légitimes :
 - ✅ Debugging et profiling
 - ✅ Security research
 - ✅ Analyse de logiciels malveillants
-
-Usages problématiques :
-- ❌ Injection/hooking malveillant
-- ❌ Contournement de protections
-- ❌ Modification de jeux vidéo
+- ✅ Reverse engineering pédagogique
 
 ---
 
@@ -549,16 +495,8 @@ Usages problématiques :
 
 ## 👤 Auteur
 
-**Storm3416** - [GitHub](https://github.com/Storm3416)
+**Storm3416** — [GitHub](https://github.com/Storm3416)
 
 ---
 
-## 📞 Support
-
-Pour les bugs, feature requests ou questions :
-- Créer une issue sur GitHub
-- Consulter la documentation des APIs NT
-
----
-
-**Dernière mise à jour** : 2026-07-01
+**Dernière mise à jour** : 2026-07-14
